@@ -1,0 +1,34 @@
+name: UniFi Protect Presence
+version: "0.1.0"
+slug: protect_presence
+description: >-
+  Bridge UniFi Protect recognized-face smart-detect events and USL-Environmental
+  leak state to MQTT. Runs its own uiprotect in an isolated container so it can
+  read private event.raw fields (face identity, external-leak) without touching
+  Home Assistant core's pinned uiprotect.
+url: "https://github.com/terafin/addon-unifi-protect-presence"
+arch:
+  - aarch64
+  - amd64
+startup: application
+boot: auto
+init: false
+services:
+  - mqtt:need
+host_network: false
+options:
+  nvr_host: ""
+  nvr_port: 443
+  nvr_username: ""
+  nvr_password: ""
+  verify_ssl: true
+  base_topic: unifi-protect-presence
+  log_level: info
+schema:
+  nvr_host: str
+  nvr_port: port
+  nvr_username: str
+  nvr_password: password
+  verify_ssl: bool
+  base_topic: str
+  log_level: list(debug|info|warning|error)
