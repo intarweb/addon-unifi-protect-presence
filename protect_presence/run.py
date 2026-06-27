@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import sys
+import time
 import warnings
 from datetime import datetime, timedelta, timezone
 
@@ -46,7 +47,8 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "info").upper()
 KEEPALIVE_SECONDS = int(os.environ.get("KEEPALIVE_SECONDS", "60"))
 FACE_MIN_CONFIDENCE = int(os.environ.get("FACE_MIN_CONFIDENCE", "70"))
 FACE_LOOKBACK_SECONDS = int(os.environ.get("FACE_LOOKBACK_SECONDS", "180"))
-FACE_DEBOUNCE_SECONDS = int(os.environ.get("FACE_DEBOUNCE_SECONDS", "4"))
+FACE_WINDOW_SECONDS = int(os.environ.get("FACE_WINDOW_SECONDS", "120"))
+FACE_POLL_SECONDS = int(os.environ.get("FACE_POLL_SECONDS", "8"))
 
 MQTT_HOST = os.environ["MQTT_HOST"]
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
@@ -63,7 +65,7 @@ _LEAK_STATE: dict[str, str] = {}
 _LEAK_RAW: dict[str, dict] = {}
 _SEEN_FACE_EVENTS: set[str] = set()   # published recognized-face event ids (dedup)
 _WS_TAP_INSTALLED = False
-_FACE_PENDING = False                 # set by WS tap on a face detection; worker does REST lookup
+_FACE_ACTIVE_UNTIL = 0.0              # monotonic deadline; a WS face detection opens a REST-lookup window
 _PROTECT: ProtectApiClient | None = None
 _CLIENT: mqtt.Client | None = None
 
@@ -213,7 +215,7 @@ def install_ws_tap(protect: ProtectApiClient, client: mqtt.Client):
     orig = bcls.process_ws_packet
 
     def tapped(self, packet, *a, **k):
-        global _FACE_PENDING
+        global _FACE_ACTIVE_UNTIL
         try:
             af = getattr(packet.action_frame, "data", None)
             df = getattr(packet.data_frame, "data", None)
@@ -227,7 +229,8 @@ def install_ws_tap(protect: ProtectApiClient, client: mqtt.Client):
                 elif mk == "event":
                     sdt = df.get("smartDetectTypes")
                     if sdt and "face" in sdt:
-                        _FACE_PENDING = True  # name isn't on the WS; trigger a REST lookup
+                        # name isn't on the WS + attaches at event-end; open a REST-lookup window
+                        _FACE_ACTIVE_UNTIL = time.monotonic() + FACE_WINDOW_SECONDS
         except Exception:  # noqa: BLE001
             LOG.exception("ws tap error")
         return orig(self, packet, *a, **k)
@@ -264,14 +267,13 @@ async def lookup_and_publish_faces(protect: ProtectApiClient, client: mqtt.Clien
 
 
 async def face_worker():
-    """Long-lived: when the WS tap flags face activity, debounce then do ONE REST lookup.
-    REST is hit only after a real WS face detection — never idle polling."""
-    global _FACE_PENDING
+    """Long-lived: a WS face detection opens a short window during which we poll REST for the
+    recognized name (which only attaches at event-end). REST runs ONLY inside that post-
+    detection window — never idle polling. Dedup by event id prevents repeats."""
     while True:
-        await asyncio.sleep(FACE_DEBOUNCE_SECONDS)
-        if not _FACE_PENDING or _PROTECT is None or _CLIENT is None:
+        await asyncio.sleep(FACE_POLL_SECONDS)
+        if _PROTECT is None or _CLIENT is None or time.monotonic() >= _FACE_ACTIVE_UNTIL:
             continue
-        _FACE_PENDING = False
         try:
             await lookup_and_publish_faces(_PROTECT, _CLIENT)
         except Exception:  # noqa: BLE001
