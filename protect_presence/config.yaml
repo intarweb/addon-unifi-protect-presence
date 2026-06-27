@@ -1,5 +1,5 @@
 name: UniFi Protect Presence
-version: "0.4.0"
+version: "0.5.0"
 slug: protect_presence
 description: >-
   Bridge UniFi Protect recognized-face smart-detect events and USL-Environmental
@@ -24,6 +24,7 @@ options:
   verify_ssl: true
   base_topic: unifi-protect-presence
   log_level: info
+  face_min_confidence: 70
 schema:
   nvr_host: str
   nvr_port: port
@@ -32,3 +33,4 @@ schema:
   verify_ssl: bool
   base_topic: str
   log_level: list(debug|info|warning|error)
+  face_min_confidence: int(0,100)
