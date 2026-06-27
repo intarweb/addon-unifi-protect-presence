@@ -108,10 +108,11 @@ def deep_find_all(node, key):
 def extract_face(raw: dict):
     """Return (name, score) for a recognized face, or (None, None) if no name matched.
 
-    Known private paths (confirm against live debug dumps):
-      raw[metadata][detectedThumbnails][i] where type=='face' -> .name (+ .score/.confidence)
-      raw[metadata][group][matchedName]
-    Walked defensively so a shape change degrades to 'no match' rather than crashing.
+    Confirmed against live events: a recognized face is
+      raw[metadata][detectedThumbnails][i] with type=='face' AND a `name` (+ `confidence`).
+    An UNKNOWN face is type=='face' with NO `name` (only a `group.id`) -> returns None, so
+    only recognized people are published. Walked defensively; a shape change degrades to
+    'no match' rather than crashing.
     """
     name = None
     score = None
@@ -158,10 +159,16 @@ def parse_ts(v):
 
 
 def is_leak_capable(raw: dict) -> bool:
-    # Only USL-Environmental probes carry a real leak sensor. USL-Entry (door/window)
-    # and other types ALL expose a null `leakDetectedAt` field, so matching on the
-    # field name over-detects (v0.1 tagged doors/windows as leak sensors). Gate on type.
-    return raw.get("type") == "USL-Environmental-US"
+    # Two gates, both confirmed against live bootstrap:
+    #  1. type must be USL-Environmental-US — USL-Entry (door/window) units also carry a null
+    #     `leakDetectedAt`, so matching the field name over-detects (v0.1 tagged 14 doors/
+    #     windows as leak sensors).
+    #  2. among USL-Environmental, only LEAK-configured units have a probe; climate-configured
+    #     ones (live temp/humidity) don't. The 5 real leak units have temperatureSettings
+    #     .isEnabled==False (+ null temp/humidity stats); the 4 climate units have it True.
+    if raw.get("type") != "USL-Environmental-US":
+        return False
+    return not (raw.get("temperatureSettings") or {}).get("isEnabled", False)
 
 
 def leak_state(raw: dict) -> str:
