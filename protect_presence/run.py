@@ -9,11 +9,14 @@ add-on runs its own (latest) uiprotect in an isolated container and uses the pri
 `subscribe_websocket` path (NOT the typed `subscribe_events`, which needs an API key
 and DROPS face identity).
 
-v0.1 is intentionally DEFENSIVE + DEBUG-DUMPING: the exact `raw` paths for face name
-and leak state are private/undocumented, so this build walks the structures defensively
-and, at log_level=debug, dumps the full raw of every smart-detect event + every Sensor
-delta so the live shapes can be confirmed and the extraction finalized. Spots that need
-confirming against live data are marked `# FINALIZE:`.
+v0.2 is PERF-SAFE (v0.1 overloaded HA: per-WS-frame json.dumps + debug firehose +
+over-broad MQTT leak flood starved the shared host's event loop on 2026-06-27). This
+build: classifies every WS frame by its typed object's class name FIRST (cheap) and only
+does raw extraction for the rare Event/Sensor frames; never logs or json.dumps per frame;
+gates leak on type=='USL-Environmental-US'; publishes leak/face discovery scoped to real
+probes only. The private `raw` paths for face name + leak state are still best-effort and
+marked `# FINALIZE:` — pending confirmation against live data, a wrong path degrades to
+"no match" (it cannot overload HA).
 """
 import asyncio
 import contextlib
@@ -21,9 +24,16 @@ import json
 import logging
 import os
 import sys
+import warnings
 from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
+
+# uiprotect parses NVR JSON into pydantic models whose field types don't always match what
+# the firmware sends (e.g. an int-typed `ratio` arriving as 2.36). Pydantic emits a benign
+# UserWarning on serialization — the value is still used. Known uiprotect/HA-core noise
+# (home-assistant/core#134280). Silence it so it doesn't clutter the add-on log.
+warnings.filterwarnings("ignore", message="Pydantic serializer warnings")
 
 from uiprotect import ProtectApiClient
 
@@ -148,8 +158,10 @@ def parse_ts(v):
 
 
 def is_leak_capable(raw: dict) -> bool:
-    keys = ("externalLeakDetectedAt", "leakDetectedAt", "leakSettings")
-    return any(k in raw for k in keys) or "LEAK" in json.dumps(raw.get("mountType", "")).upper()
+    # Only USL-Environmental probes carry a real leak sensor. USL-Entry (door/window)
+    # and other types ALL expose a null `leakDetectedAt` field, so matching on the
+    # field name over-detects (v0.1 tagged doors/windows as leak sensors). Gate on type.
+    return raw.get("type") == "USL-Environmental-US"
 
 
 def leak_state(raw: dict) -> str:
@@ -252,15 +264,18 @@ def make_callback(client: mqtt.Client):
 
 
 def _handle(client: mqtt.Client, msg):
-    # WSSubscriptionMessage shape varies by uiprotect version — dig defensively.
+    # PERF: classify by the typed object's class name FIRST — cheap. Only the small
+    # fraction of frames that are Events/Sensors get the (costly) raw extraction.
+    # Serializing EVERY WS frame (obj_raw -> unifi_dict, json.dumps) starves HA's
+    # event loop on a busy NVR — that overloaded HA in v0.1.
     obj = getattr(msg, "new_obj", None) or getattr(msg, "old_obj", None)
-    raw = obj_raw(obj)
-    model = (raw.get("modelKey") or getattr(obj, "model", None) or "").lower() if raw or obj else ""
-    otype = type(obj).__name__.lower() if obj is not None else ""
+    if obj is None:
+        return
+    otype = type(obj).__name__.lower()
 
     # --- smart-detect / face events ---
-    if "event" in model or "event" in otype or "smartdetect" in json.dumps(raw)[:200].lower():
-        LOG.debug("smart-detect event raw: %s", json.dumps(raw, default=str)[:8000])
+    if "event" in otype:
+        raw = obj_raw(obj)
         name, score = extract_face(raw)
         if name:
             cam_id = str(raw.get("camera") or raw.get("cameraId") or "")
@@ -269,19 +284,21 @@ def _handle(client: mqtt.Client, msg):
         return
 
     # --- sensor / leak deltas ---
-    if "sensor" in model or "sensor" in otype:
-        LOG.debug("sensor delta raw: %s", json.dumps(raw, default=str)[:4000])
+    if "sensor" in otype:
+        raw = obj_raw(obj)
+        if not is_leak_capable(raw):
+            return
         sid = str(raw.get("id") or getattr(obj, "id", "") or "")
         if not sid:
             return
-        if is_leak_capable(raw):
-            if sid not in _LEAK_STATE:  # first sight via WS — ensure discovery exists
-                nm = raw.get("name") or getattr(obj, "name", None) or f"Sensor {sid}"
-                publish_leak_discovery(client, sid, nm)
-            publish_leak_state(client, sid, leak_state(raw))
+        if sid not in _LEAK_STATE:  # first sight via WS — ensure discovery exists
+            nm = raw.get("name") or getattr(obj, "name", None) or f"Sensor {sid}"
+            publish_leak_discovery(client, sid, nm)
+        publish_leak_state(client, sid, leak_state(raw))
         return
 
-    LOG.debug("ignored WS msg model=%s type=%s", model, otype)
+    # everything else (camera / nvr / user / light updates — the bulk of frames) is
+    # ignored cheaply: NO raw extraction, NO per-frame logging.
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +331,9 @@ async def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stdout,
     )
+    # Quiet third-party firehoses so debug shows OUR lines, not uiprotect's per-WS-frame spam.
+    for _noisy in ("uiprotect", "aiohttp", "asyncio", "urllib3", "websockets"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
     client = make_mqtt()
     backoff = 5
     while True:
