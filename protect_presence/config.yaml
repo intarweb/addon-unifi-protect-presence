@@ -1,5 +1,5 @@
 name: UniFi Protect Presence
-version: "0.2.1"
+version: "0.3.0"
 slug: protect_presence
 description: >-
   Bridge UniFi Protect recognized-face smart-detect events and USL-Environmental

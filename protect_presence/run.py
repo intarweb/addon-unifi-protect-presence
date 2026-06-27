@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
-"""UniFi Protect Presence — bridge Protect → MQTT for recognized-face smart-detect
-events and USL-Environmental leak state.
+"""UniFi Protect Presence — bridge Protect recognized-face events and USL-Environmental
+leak state to MQTT.
 
-Why standalone (not the HA `unifiprotect` integration): the recognized face NAME and
-the external-leak fields are PRIVATE-API, exposed only via `event.raw` / raw Sensor
-fields. The bundled integration pins an older uiprotect in core's shared env. This
-add-on runs its own (latest) uiprotect in an isolated container and uses the private
-`subscribe_websocket` path (NOT the typed `subscribe_events`, which needs an API key
-and DROPS face identity).
+Why standalone (not the HA `unifiprotect` integration): the recognized face NAME and the
+external-leak fields are PRIVATE-API, exposed only in the raw NVR JSON. The bundled
+integration pins an older uiprotect in core's shared env.
 
-v0.2 is PERF-SAFE (v0.1 overloaded HA: per-WS-frame json.dumps + debug firehose +
-over-broad MQTT leak flood starved the shared host's event loop on 2026-06-27). This
-build: classifies every WS frame by its typed object's class name FIRST (cheap) and only
-does raw extraction for the rare Event/Sensor frames; never logs or json.dumps per frame;
-gates leak on type=='USL-Environmental-US'; publishes leak/face discovery scoped to real
-probes only. The private `raw` paths for face name + leak state are still best-effort and
-marked `# FINALIZE:` — pending confirmation against live data, a wrong path degrades to
-"no match" (it cannot overload HA).
+v0.3 leak path = TRUE-RAW POLL. uiprotect's pydantic model SILENTLY DROPS `leakSettings`
+and `externalLeakDetectedAt` (the external water-probe fields), so neither the bootstrap
+objects nor the WS deltas expose them — a real leak on an external probe is invisible via
+the model (burned 2026-06-27: contacts test worked via onboard `leakDetectedAt`, which the
+model keeps, but the external water probe set `externalLeakDetectedAt`, which it drops).
+So leak state is polled from `api_request_list("sensors")` (the raw NVR JSON) every
+POLL_SECONDS. Faces still come over the WS event stream (the event metadata, incl. the
+recognized `name`, IS preserved). Perf-safe: WS frames are classified by type first (no
+per-frame json.dumps/logging that starved HA in v0.1); the poll is one cheap API call.
 """
 import asyncio
 import contextlib
@@ -47,6 +45,7 @@ NVR_PASSWORD = os.environ["NVR_PASSWORD"]
 VERIFY_SSL = os.environ.get("VERIFY_SSL", "true").lower() == "true"
 BASE_TOPIC = os.environ.get("BASE_TOPIC", "unifi-protect-presence").rstrip("/")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "info").upper()
+POLL_SECONDS = int(os.environ.get("LEAK_POLL_SECONDS", "15"))
 
 MQTT_HOST = os.environ["MQTT_HOST"]
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
@@ -57,31 +56,24 @@ STATUS_TOPIC = f"{BASE_TOPIC}/status"
 FACE_TOPIC = f"{BASE_TOPIC}/face"
 DISCOVERY_PREFIX = "homeassistant"
 
-# FINALIZE: heuristic for leak ON — treat a leak timestamp within this window as "wet".
-# The real clear/OFF semantics (does Protect clear the field, or carry a separate state?)
-# get confirmed from the debug Sensor dumps against the live USL-Environmental probe.
-LEAK_RECENT_SECONDS = 600
-
-# camera id -> name, populated from bootstrap (so face events carry a friendly camera name)
-_CAMERA_NAMES: dict[str, str] = {}
-# sensor_id -> last published leak state ("ON"/"OFF"), to publish only on change
-_LEAK_STATE: dict[str, str] = {}
+_CAMERA_NAMES: dict[str, str] = {}   # camera id -> friendly name (for face events)
+_LEAK_STATE: dict[str, str] = {}     # sensor id -> last published "ON"/"OFF" (publish on change)
 
 
 # ---------------------------------------------------------------------------
-# defensive raw helpers
+# raw helpers
 # ---------------------------------------------------------------------------
 def obj_raw(obj) -> dict:
-    """Best-effort extraction of an object's raw/underlying dict, version-agnostic."""
+    """Best-effort raw dict of a uiprotect object (used for WS face events)."""
     if obj is None:
         return {}
     if isinstance(obj, dict):
         return obj
-    for attr in ("raw", "_raw"):
+    for attr in ("_raw", "raw"):
         v = getattr(obj, attr, None)
         if isinstance(v, dict):
             return v
-    for meth in ("unifi_dict", "dict", "model_dump"):
+    for meth in ("unifi_dict", "model_dump", "dict"):
         fn = getattr(obj, meth, None)
         if callable(fn):
             try:
@@ -94,7 +86,6 @@ def obj_raw(obj) -> dict:
 
 
 def deep_find_all(node, key):
-    """Yield every value stored under `key` anywhere in a nested dict/list."""
     if isinstance(node, dict):
         for k, v in node.items():
             if k == key:
@@ -106,78 +97,44 @@ def deep_find_all(node, key):
 
 
 def extract_face(raw: dict):
-    """Return (name, score) for a recognized face, or (None, None) if no name matched.
+    """Return (name, score) for a RECOGNIZED face, else (None, None).
 
     Confirmed against live events: a recognized face is
       raw[metadata][detectedThumbnails][i] with type=='face' AND a `name` (+ `confidence`).
-    An UNKNOWN face is type=='face' with NO `name` (only a `group.id`) -> returns None, so
-    only recognized people are published. Walked defensively; a shape change degrades to
-    'no match' rather than crashing.
+    An UNKNOWN face is type=='face' with NO `name` (only `group.id`) -> returns None, so
+    only recognized people are published.
     """
-    name = None
-    score = None
-
+    name = score = None
     meta = raw.get("metadata") if isinstance(raw, dict) else None
     if isinstance(meta, dict):
-        thumbs = meta.get("detectedThumbnails")
-        if isinstance(thumbs, list):
-            for t in thumbs:
-                if not isinstance(t, dict):
-                    continue
-                if t.get("type") == "face" and t.get("name"):
-                    name = t.get("name")
-                    score = t.get("score", t.get("confidence"))
-                    break
-        if name is None:
-            group = meta.get("group")
-            if isinstance(group, dict) and group.get("matchedName"):
-                name = group.get("matchedName")
-
-    # last-ditch defensive walk
-    if name is None:
-        for v in deep_find_all(raw, "matchedName"):
-            if v:
-                name = v
+        for t in (meta.get("detectedThumbnails") or []):
+            if isinstance(t, dict) and t.get("type") == "face" and t.get("name"):
+                name = t.get("name")
+                score = t.get("confidence", t.get("score"))
                 break
-
-    # ignore empty / unknown-person sentinels
     if isinstance(name, str) and name.strip().lower() in ("", "unknown", "none"):
         name = None
     return name, score
 
 
-def parse_ts(v):
-    """Protect timestamps are ms-epoch (int) or iso strings; return aware datetime or None."""
-    if v in (None, "", 0):
-        return None
-    try:
-        if isinstance(v, (int, float)):
-            return datetime.fromtimestamp(v / 1000.0, tz=timezone.utc)
-        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
-    except Exception:  # noqa: BLE001
-        return None
-
-
+# ---------------------------------------------------------------------------
+# leak (from TRUE raw NVR JSON — see module docstring)
+# ---------------------------------------------------------------------------
 def is_leak_capable(raw: dict) -> bool:
-    # Two gates, both confirmed against live bootstrap:
-    #  1. type must be USL-Environmental-US — USL-Entry (door/window) units also carry a null
-    #     `leakDetectedAt`, so matching the field name over-detects (v0.1 tagged 14 doors/
-    #     windows as leak sensors).
-    #  2. among USL-Environmental, only LEAK-configured units have a probe; climate-configured
-    #     ones (live temp/humidity) don't. The 5 real leak units have temperatureSettings
-    #     .isEnabled==False (+ null temp/humidity stats); the 4 climate units have it True.
-    if raw.get("type") != "USL-Environmental-US":
-        return False
-    return not (raw.get("temperatureSettings") or {}).get("isEnabled", False)
+    # A leak unit is one with leak detection actually enabled (onboard contacts and/or an
+    # external water probe). Confirmed against live raw: exactly the 5 "*Leak" units have
+    # leakSettings.is{Internal,External}Enabled true; doors/windows/climate units do not.
+    ls = raw.get("leakSettings") or {}
+    return bool(ls.get("isInternalEnabled") or ls.get("isExternalEnabled"))
 
 
 def leak_state(raw: dict) -> str:
-    """ON if a leak timestamp is recent, else OFF. FINALIZE against live Sensor dumps."""
-    now = datetime.now(timezone.utc)
-    for k in ("externalLeakDetectedAt", "leakDetectedAt"):
-        ts = parse_ts(raw.get(k))
-        if ts and (now - ts).total_seconds() <= LEAK_RECENT_SECONDS:
-            return "ON"
+    # Wet if either detector has a timestamp. The NVR NULLS these the moment it dries
+    # (confirmed: onboard contacts cleared to null in ~8s), so non-null == currently wet.
+    #  - leakDetectedAt:         onboard contacts
+    #  - externalLeakDetectedAt: external water probe/cable (uiprotect model drops this)
+    if raw.get("leakDetectedAt") or raw.get("externalLeakDetectedAt"):
+        return "ON"
     return "OFF"
 
 
@@ -199,7 +156,9 @@ def make_mqtt() -> mqtt.Client:
 def publish_leak_discovery(client: mqtt.Client, sensor_id: str, sensor_name: str):
     topic = f"{DISCOVERY_PREFIX}/binary_sensor/uipp_{sensor_id}_leak/config"
     payload = {
-        "name": f"{sensor_name} Leak",
+        # name=None -> the entity inherits the device name (the sensor is already named e.g.
+        # "Kitchen Leak"), giving a clean binary_sensor.kitchen_leak instead of a tripled id.
+        "name": None,
         "device_class": "moisture",
         "state_topic": f"{BASE_TOPIC}/leak/{sensor_id}",
         "payload_on": "ON",
@@ -211,7 +170,6 @@ def publish_leak_discovery(client: mqtt.Client, sensor_id: str, sensor_name: str
             "name": sensor_name,
             "manufacturer": "Ubiquiti",
             "model": "UniFi Protect Sensor",
-            "via_device": "unifi-protect-presence",
         },
     }
     client.publish(topic, json.dumps(payload), qos=1, retain=True)
@@ -238,29 +196,38 @@ def publish_face(client: mqtt.Client, name: str, camera: str, score):
 
 
 # ---------------------------------------------------------------------------
-# bootstrap seeding + WS callback
+# leak poll (TRUE raw) + camera-name seed
 # ---------------------------------------------------------------------------
-def seed_from_bootstrap(protect: ProtectApiClient, client: mqtt.Client):
-    bootstrap = protect.bootstrap
-    cameras = getattr(bootstrap, "cameras", {}) or {}
+def seed_camera_names(protect: ProtectApiClient):
+    cameras = getattr(protect.bootstrap, "cameras", {}) or {}
     for cid, cam in (cameras.items() if hasattr(cameras, "items") else []):
         nm = getattr(cam, "name", None) or obj_raw(cam).get("name")
         if nm:
             _CAMERA_NAMES[str(cid)] = nm
-    sensors = getattr(bootstrap, "sensors", {}) or {}
+    LOG.info("seeded %d camera name(s)", len(_CAMERA_NAMES))
+
+
+async def poll_leaks(protect: ProtectApiClient, client: mqtt.Client, seed: bool = False):
+    """Fetch the TRUE raw sensor JSON and publish leak discovery/state on change."""
+    rows = await protect.api_request_list("sensors")
     n = 0
-    for sid, sensor in (sensors.items() if hasattr(sensors, "items") else []):
-        raw = obj_raw(sensor)
-        LOG.debug("bootstrap sensor %s raw: %s", sid, json.dumps(raw, default=str)[:4000])
-        if not is_leak_capable(raw):
+    for s in rows:
+        if not isinstance(s, dict) or not is_leak_capable(s):
             continue
-        nm = getattr(sensor, "name", None) or raw.get("name") or f"Sensor {sid}"
-        publish_leak_discovery(client, str(sid), nm)
-        publish_leak_state(client, str(sid), leak_state(raw))
+        sid = str(s.get("id") or "")
+        if not sid:
+            continue
+        if seed or sid not in _LEAK_STATE:
+            publish_leak_discovery(client, sid, s.get("name") or f"Sensor {sid}")
+        publish_leak_state(client, sid, leak_state(s))
         n += 1
-    LOG.info("seeded %d leak-capable sensor(s) from bootstrap; %d camera name(s)", n, len(_CAMERA_NAMES))
+    if seed:
+        LOG.info("seeded %d leak sensor(s) from true raw", n)
 
 
+# ---------------------------------------------------------------------------
+# WS callback — FACES ONLY (leak is polled; the model can't carry external leak)
+# ---------------------------------------------------------------------------
 def make_callback(client: mqtt.Client):
     def callback(msg):
         try:
@@ -271,41 +238,19 @@ def make_callback(client: mqtt.Client):
 
 
 def _handle(client: mqtt.Client, msg):
-    # PERF: classify by the typed object's class name FIRST — cheap. Only the small
-    # fraction of frames that are Events/Sensors get the (costly) raw extraction.
-    # Serializing EVERY WS frame (obj_raw -> unifi_dict, json.dumps) starves HA's
-    # event loop on a busy NVR — that overloaded HA in v0.1.
+    # Classify by the typed object's class name FIRST (cheap). Only Event frames get the
+    # (costly) raw extraction; everything else is ignored with no raw work / no logging.
     obj = getattr(msg, "new_obj", None) or getattr(msg, "old_obj", None)
     if obj is None:
         return
-    otype = type(obj).__name__.lower()
-
-    # --- smart-detect / face events ---
-    if "event" in otype:
-        raw = obj_raw(obj)
-        name, score = extract_face(raw)
-        if name:
-            cam_id = str(raw.get("camera") or raw.get("cameraId") or "")
-            camera = _CAMERA_NAMES.get(cam_id, cam_id or "unknown")
-            publish_face(client, name, camera, score)
+    if "event" not in type(obj).__name__.lower():
         return
-
-    # --- sensor / leak deltas ---
-    if "sensor" in otype:
-        raw = obj_raw(obj)
-        if not is_leak_capable(raw):
-            return
-        sid = str(raw.get("id") or getattr(obj, "id", "") or "")
-        if not sid:
-            return
-        if sid not in _LEAK_STATE:  # first sight via WS — ensure discovery exists
-            nm = raw.get("name") or getattr(obj, "name", None) or f"Sensor {sid}"
-            publish_leak_discovery(client, sid, nm)
-        publish_leak_state(client, sid, leak_state(raw))
-        return
-
-    # everything else (camera / nvr / user / light updates — the bulk of frames) is
-    # ignored cheaply: NO raw extraction, NO per-frame logging.
+    raw = obj_raw(obj)
+    name, score = extract_face(raw)
+    if name:
+        cam_id = str(raw.get("camera") or raw.get("cameraId") or "")
+        camera = _CAMERA_NAMES.get(cam_id, cam_id or "unknown")
+        publish_face(client, name, camera, score)
 
 
 # ---------------------------------------------------------------------------
@@ -317,14 +262,21 @@ async def run_once(client: mqtt.Client):
     )
     await protect.update()  # bootstrap + open WS
     LOG.info("bootstrapped against %s", NVR_HOST)
-    seed_from_bootstrap(protect, client)
+    seed_camera_names(protect)
+    await poll_leaks(protect, client, seed=True)
     unsub = protect.subscribe_websocket(make_callback(client))
-    LOG.info("subscribed to Protect websocket; streaming events")
+    LOG.info("subscribed to Protect WS (faces); polling leaks every %ds", POLL_SECONDS)
     try:
-        # keep alive; periodic update() keeps cookie/bootstrap fresh
+        i = 0
         while True:
-            await asyncio.sleep(60)
-            await protect.update()
+            await asyncio.sleep(POLL_SECONDS)
+            i += 1
+            try:
+                await poll_leaks(protect, client)
+            except Exception:  # noqa: BLE001
+                LOG.exception("leak poll failed")
+            if i % 4 == 0:  # ~every 4*POLL keep WS/cookie/bootstrap fresh
+                await protect.update()
     finally:
         with contextlib.suppress(Exception):
             unsub()
@@ -338,7 +290,6 @@ async def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stdout,
     )
-    # Quiet third-party firehoses so debug shows OUR lines, not uiprotect's per-WS-frame spam.
     for _noisy in ("uiprotect", "aiohttp", "asyncio", "urllib3", "websockets"):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
     client = make_mqtt()
