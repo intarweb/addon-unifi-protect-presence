@@ -15,14 +15,15 @@
 name: build
 
 on:
-  push:
-  # PRs opened against the fork also trigger a build (fork PRs may carry our
-  # canonical build.yml only after a branch push, so a later-opened PR would
-  # otherwise miss the fold). The shared builder's classify step no-ops the
-  # PR-triggered runs for greenfield non-default branches.
-  pull_request:
+  push:                    # any branch push — the branch that heads an upstream PR
+  pull_request:            # PRs opened AGAINST the fork (fork-internal PRs)
   schedule:
-    - cron: '23 */6 * * *'    # "on a clock" — re-checks upstream + open PRs
+    # Frequent fold check: GitHub fires NO event on the fork when an
+    # intarweb->upstream PR is opened (pull_request fires only on the base
+    # repo), so this short interval is what actually catches a newly-posted
+    # upstream PR. No-op when nothing changed (fingerprint gate).
+    - cron: '*/15 * * * *'
+    - cron: '23 */6 * * *'    # upstream re-sync cadence
   workflow_dispatch:
 
 permissions:
