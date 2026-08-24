@@ -22,7 +22,7 @@ on:
     # intarweb->upstream PR is opened (pull_request fires only on the base
     # repo), so this short interval is what actually catches a newly-posted
     # upstream PR. No-op when nothing changed (fingerprint gate).
-    - cron: '*/15 * * * *'
+    - cron: '*/5 * * * *'    # 5-min minimum (GH docs): fold a newly-opened upstream PR (only poll event the fork gets)
     - cron: '23 */6 * * *'    # upstream re-sync cadence
   workflow_dispatch:
 
