@@ -25,7 +25,7 @@ on:
     # main mirrored to upstream, re-arms the seed onto PR branches that a
     # rebase dropped it from, and folds newly-opened PRs. The instant path is
     # `push` above.
-    - cron: '23 */6 * * *'    # upstream re-sync + seed re-arm + fold
+    - cron: '4 4 * * *'    # daily upstream re-sync + seed re-arm + fold (~4 AM local)
   workflow_dispatch:
 
 permissions:
